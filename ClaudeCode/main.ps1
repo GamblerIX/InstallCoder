@@ -17,6 +17,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = 'SilentlyContinue'
 
+# 保存脚本路径（用于在函数内部引用）
+$script:ScriptPath = $MyInvocation.MyCommand.Definition
+$script:ScriptDir = Split-Path -Parent $script:ScriptPath
+
 # 配置常量
 $GCS_BUCKET = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
 $DOWNLOAD_DIR = "$env:USERPROFILE\.claude\downloads"
@@ -509,9 +513,8 @@ function Install-ClaudeCode {
             Write-Log "INFO" "检测到证书验证错误，正在尝试使用 pnpm 方式安装..."
             Write-Log "INFO" ""
             
-            # 获取当前脚本所在目录
-            $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-            $pnpmScript = Join-Path $scriptDir "pnpm.ps1"
+            # 获取当前脚本所在目录（使用保存的变量）
+            $pnpmScript = Join-Path $script:ScriptDir "pnpm.ps1"
             
             # 检查 pnpm.ps1 是否存在
             if (Test-Path $pnpmScript) {
