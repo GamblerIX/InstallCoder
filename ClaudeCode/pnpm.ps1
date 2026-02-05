@@ -161,8 +161,13 @@ function Install-ClaudeWithPnpm {
     Write-Log "INFO" (Get-Message "InstallingClaude")
     
     try {
-        # 使用 pnpm 全局安装 @anthropic-ai/claude
-        & pnpm add -g @anthropic-ai/claude
+        # 配置使用淘宝镜像（中国用户优化）
+        Write-Log "INFO" "配置 pnpm 使用淘宝镜像..."
+        & npm config set registry https://registry.npmmirror.com/
+        
+        # 使用 pnpm 全局安装 @anthropic-ai/claude-code
+        # 使用 --registry 参数确保使用淘宝镜像
+        & pnpm add -g @anthropic-ai/claude-code --registry https://registry.npmmirror.com/
         
         if ($LASTEXITCODE -ne 0) {
             throw "pnpm 安装 Claude Code 失败"
@@ -211,7 +216,7 @@ function Install-ClaudeCode {
         Write-Log "INFO" "检测到 pnpm: $($pnpmPath.Source)"
     }
     
-    # 安装 Claude Code
+    # 安装 Claude Code (pnpm 方式)
     $claudeInstalled = Install-ClaudeWithPnpm
     
     if (-not $claudeInstalled) {
@@ -221,10 +226,9 @@ function Install-ClaudeCode {
     }
     
     Write-Log "SUCCESS" ""
-    Write-Log "SUCCESS" "Claude Code 安装完成！"
+    Write-Log "SUCCESS" "Claude Code (pnpm 版) 安装完成！"
     Write-Log "SUCCESS" ""
-    Write-Log "INFO" "请重新打开 PowerShell 或运行 'refreshenv' 刷新环境变量。"
-    Write-Log "INFO" "然后运行 'claude' 开始使用。"
+    Write-Log "INFO" "运行 'claude' 开始使用。"
 }
 
 # 主程序

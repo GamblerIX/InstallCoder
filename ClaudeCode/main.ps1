@@ -27,7 +27,7 @@ $DOWNLOAD_DIR = "$env:USERPROFILE\.claude\downloads"
 $LOG_DIR = "$env:USERPROFILE\.claude\logs"
 $platform = "win32-x64"
 
-# 语言字符串资源（仅中文）
+# 中文字符串资源
 $script:Messages = @{
     "HelpText" = @"
 Claude Code 安装脚本
@@ -122,6 +122,81 @@ function Save-Log {
     $logFile = Join-Path $LOG_DIR "install-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
     $script:LogContent | Out-File -FilePath $logFile -Encoding UTF8
     return $logFile
+}
+
+# 安全删除文件（使用 .NET 方法避免 PowerShell 别名冲突）
+function Remove-FileSafe {
+    param([string]$Path)
+    try {
+        if (Test-Path $Path) {
+            [System.IO.File]::Delete($Path)
+        }
+    } catch {
+        Write-Log "WARN" "无法删除文件: $Path - $_"
+    }
+    # 不返回任何值，避免输出到控制台
+}
+
+# 刷新环境变量
+function Update-EnvironmentVariables {
+    Write-Log "INFO" "正在刷新环境变量..."
+    
+    # 重新加载 Machine 和 User 级别的环境变量
+    foreach ($level in "Machine", "User") {
+        [Environment]::GetEnvironmentVariables($level).GetEnumerator() | ForEach-Object {
+            $name = $_.Key
+            $value = $_.Value
+            Set-Item -Path Env:$name -Value $value
+        }
+    }
+    
+    Write-Log "INFO" "环境变量已刷新"
+}
+
+# 执行原生 Claude Code 安装（通过 pnpm 安装的 claude）
+function Install-NativeClaude {
+    Write-Log "INFO" "正在安装原生 Claude Code..."
+    
+    try {
+        # 刷新环境变量确保能找到 claude 命令
+        Update-EnvironmentVariables
+        
+        # 检查 claude 命令是否可用
+        $claudePath = Get-Command "claude" -ErrorAction SilentlyContinue
+        
+        if (-not $claudePath) {
+            # 尝试从 pnpm 全局目录查找
+            $pnpmGlobalDir = & pnpm root -g 2>$null
+            if ($pnpmGlobalDir) {
+                $claudeExe = Join-Path $pnpmGlobalDir ".bin\claude.cmd"
+                if (Test-Path $claudeExe) {
+                    $claudePath = @{ Source = $claudeExe }
+                }
+            }
+        }
+        
+        if ($claudePath) {
+            Write-Log "INFO" "找到 Claude: $($claudePath.Source)"
+            Write-Log "INFO" "尝试安装原生 Claude Code..."
+
+            # 执行 claude install 安装原生版本
+            & $claudePath.Source install --force
+            
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "SUCCESS" "原生 Claude Code 安装成功！"
+                return $true
+            } else {
+                Write-Log "WARN" "原生安装返回退出代码: $LASTEXITCODE"
+                return $false
+            }
+        } else {
+            Write-Log "WARN" "无法找到 claude 命令，跳过原生安装"
+            return $false
+        }
+    } catch {
+        Write-Log "WARN" "原生安装失败: $_"
+        return $false
+    }
 }
 
 # 获取系统代理
@@ -420,11 +495,11 @@ function Install-ClaudeCode {
                 $needsDownload = $false
             } else {
                 Write-Log "WARN" "本地文件校验和不匹配, 重新下载。"
-                Remove-Item -Force $binaryPath
+                Remove-FileSafe -Path $binaryPath
             }
         } catch {
             Write-Log "WARN" "无法验证本地文件, 重新下载。"
-            Remove-Item -Force $binaryPath -ErrorAction SilentlyContinue
+            Remove-FileSafe -Path $binaryPath
         }
     }
 
@@ -448,9 +523,7 @@ function Install-ClaudeCode {
                 $retryCount++
                 Write-Log "WARN" "下载尝试 $retryCount 失败: $_"
 
-                if (Test-Path $binaryPath) {
-                    Remove-Item -Force $binaryPath
-                }
+                Remove-FileSafe -Path $binaryPath
 
                 if ($retryCount -eq $maxRetries) {
                     Write-Log "ERROR" (Get-Message "ErrorDownload")
@@ -470,14 +543,14 @@ function Install-ClaudeCode {
 
     if ($actualChecksum -ne $checksum) {
         Write-Log "ERROR" (Get-Message "ErrorVerify")
-        Remove-Item -Force $binaryPath
+        Remove-FileSafe -Path $binaryPath
 
         $logFile = Save-Log
         Write-Log "INFO" (Get-Message "LogSaved" $logFile)
         exit 1
     }
 
-    # 执行安装 - 使用直接调用方式（与 bootstrap.ps1 一致）
+    # 执行安装
     Write-Log "INFO" (Get-Message "Installing")
     $installSuccess = $false
     
@@ -486,7 +559,7 @@ function Install-ClaudeCode {
     $ErrorActionPreference = "Continue"
     
     try {
-        # 始终添加 --force 参数以绕过证书验证
+        # 始终添加 --force 参数以尝试绕过证书验证
         if ($Target -and $Target -ne "latest") {
             & $binaryPath install $Target --force
         } else {
@@ -515,15 +588,25 @@ function Install-ClaudeCode {
             
             # 获取当前脚本所在目录（使用保存的变量）
             $pnpmScript = Join-Path $script:ScriptDir "pnpm.ps1"
+            $pnpmUrl = "https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/pnpm.ps1"
             
-            # 检查 pnpm.ps1 是否存在
+            # 检查 pnpm.ps1 是否存在，如果不存在则下载
+            if (-not (Test-Path $pnpmScript)) {
+                Write-Log "INFO" "本地未找到 pnpm.ps1，正在从 GitHub 下载..."
+                try {
+                    Invoke-WebRequest -Uri $pnpmUrl -OutFile $pnpmScript -UseBasicParsing
+                    Write-Log "SUCCESS" "pnpm.ps1 下载完成"
+                } catch {
+                    Write-Log "ERROR" "下载 pnpm.ps1 失败: $_"
+                }
+            }
+            
+            # 检查 pnpm.ps1 是否存在（下载后再次检查）
             if (Test-Path $pnpmScript) {
                 Write-Log "INFO" "正在调用 pnpm 安装脚本..."
                 
                 # 清理当前下载的文件
-                if (Test-Path $binaryPath) {
-                    Remove-Item -Force $binaryPath -ErrorAction SilentlyContinue
-                }
+                Remove-FileSafe -Path $binaryPath
                 
                 # 执行 pnpm 安装脚本
                 try {
@@ -533,6 +616,17 @@ function Install-ClaudeCode {
                         Write-Log "SUCCESS" ""
                         Write-Log "SUCCESS" "通过 pnpm 方式安装成功！"
                         Write-Log "SUCCESS" ""
+                        
+                        # pnpm 安装成功后，执行 claude install 安装原生版本
+                        $nativeInstalled = Install-NativeClaude
+                        
+                        if ($nativeInstalled) {
+                            Write-Log "SUCCESS" "原生 Claude Code 已成功安装！"
+                        } else {
+                            Write-Log "WARN" "原生安装失败，但 pnpm 版 Claude Code 已可用。"
+                            Write-Log "INFO" "您可以稍后手动运行 'claude install' 安装原生版本。"
+                        }
+                        
                         $installSuccess = $true
                     } else {
                         throw "pnpm 安装失败"
@@ -543,7 +637,7 @@ function Install-ClaudeCode {
                     Write-Log "INFO" "建议手动安装："
                     Write-Log "INFO" "1. 安装 Node.js: https://nodejs.org/"
                     Write-Log "INFO" "2. 安装 pnpm: npm install -g pnpm"
-                    Write-Log "INFO" "3. 安装 Claude: pnpm add -g @anthropic-ai/claude"
+                    Write-Log "INFO" "3. 安装 Claude: pnpm add -g @anthropic-ai/claude-code"
                 }
             } else {
                 Write-Log "WARN" "未找到 pnpm.ps1 脚本，无法自动回退。"
@@ -563,14 +657,8 @@ function Install-ClaudeCode {
         # 清理
         if ($installSuccess) {
             Write-Log "INFO" (Get-Message "CleaningUp")
-            try {
-                Start-Sleep -Seconds 1
-                if (Test-Path $binaryPath) {
-                    Remove-Item -Force $binaryPath
-                }
-            } catch {
-                Write-Log "WARN" "无法删除临时文件: $binaryPath"
-            }
+            Start-Sleep -Seconds 1
+            Remove-FileSafe -Path $binaryPath
         }
     }
 

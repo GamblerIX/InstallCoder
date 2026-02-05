@@ -4,7 +4,7 @@
 
 ## Claude Code
 
-### Claude Code（Windows原生）- 推荐
+### Claude Code（Windows原生）
 
 ```Powershell
 irm https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/main.ps1 | iex
@@ -16,10 +16,6 @@ irm https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/mai
 1. 参数指定的代理 (`-Proxy`)
 2. 环境变量代理 (`$env:HTTP_PROXY`)
 3. 系统代理设置
-
-#### 智能回退机制
-
-当原生安装遇到证书验证错误时，脚本会自动回退到 **pnpm 方式** 安装，无需手动干预。
 
 #### 参数说明
 
@@ -34,30 +30,16 @@ irm https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/mai
 .\main.ps1 -Help
 ```
 
-#### 故障排查
-
-如果安装失败，脚本会：
-- 显示中文错误提示
-- 自动尝试 pnpm 方式安装
-- 生成详细日志到 `~\.claude\logs\`
-
 ---
 
 ### Claude Code（pnpm方式）
 
-> 当原生安装遇到证书问题时，会自动回退到此方式。
+> 当原生安装遇到证书问题时，会自动回退到此方式以在pnpm安装完成后尝试升级原生安装。
 > 如果Windows没有nodejs环境，将自动下载最新的LTS版本到 `~\nodejs` 中并添加系统级环境Path。
 
 ```Powershell
 irm https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/pnpm.ps1 | iex
 ```
-
-#### 功能特点
-
-- 自动检测并安装 Node.js（如果没有）
-- 自动检测并安装 pnpm（如果没有）
-- 使用 pnpm 全局安装 Claude Code
-- 自动配置环境变量
 
 ---
 
@@ -77,28 +59,8 @@ unknown certificate verification error
 Try running with --force to override checks
 ```
 
-**解决方案：**
+**规避解决方案：**
 
-脚本已自动处理此问题：
-1. 首先尝试原生安装（使用 `--force` 参数）
-2. 如果失败，自动回退到 **pnpm 方式** 安装
-3. 无需手动干预
-
-如果自动回退也失败，可以手动安装：
-1. 安装 Node.js: https://nodejs.org/
-2. 安装 pnpm: `npm install -g pnpm`
-3. 安装 Claude: `pnpm add -g @anthropic-ai/claude`
-
----
-
-## 中国用户特别提示
-
-由于 Google Cloud Storage 在国内访问受限，建议使用代理：
-
-- **Clash** 默认端口: `http://127.0.0.1:7890`
-- **v2rayN** 默认端口: `http://127.0.0.1:10809`
-
-使用代理安装：
-```Powershell
-irm https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/main.ps1 | iex -Proxy "http://127.0.0.1:7890"
-```
+脚本将自动迂回处理此问题：
+1. 回退至pnpm安装
+2. 安装完成后自动执行`claude install`尝试原生安装
