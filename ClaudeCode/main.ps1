@@ -496,17 +496,63 @@ function Install-ClaudeCode {
             throw "Claude Code 安装程序返回退出代码: $LASTEXITCODE"
         }
     } catch {
+        $errorMsg = $_
         Write-Log "ERROR" (Get-Message "ErrorInstall")
-        Write-Log "ERROR" $_
-        Write-Log "INFO" ""
-        Write-Log "INFO" (Get-Message "BinaryLocation" $binaryPath)
-        Write-Log "INFO" "安装失败，请检查错误信息或手动安装。"
-
-        $logFile = Save-Log
-        Write-Log "INFO" (Get-Message "LogSaved" $logFile)
+        Write-Log "ERROR" $errorMsg
         
-        # 保留文件供手动安装
-        exit 1
+        # 检查是否是证书验证错误
+        if ($errorMsg -match "certificate verification error" -or 
+            $errorMsg -match "unknown certificate" -or
+            $LASTEXITCODE -eq 1) {
+            
+            Write-Log "INFO" ""
+            Write-Log "INFO" "检测到证书验证错误，正在尝试使用 pnpm 方式安装..."
+            Write-Log "INFO" ""
+            
+            # 获取当前脚本所在目录
+            $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+            $pnpmScript = Join-Path $scriptDir "pnpm.ps1"
+            
+            # 检查 pnpm.ps1 是否存在
+            if (Test-Path $pnpmScript) {
+                Write-Log "INFO" "正在调用 pnpm 安装脚本..."
+                
+                # 清理当前下载的文件
+                if (Test-Path $binaryPath) {
+                    Remove-Item -Force $binaryPath -ErrorAction SilentlyContinue
+                }
+                
+                # 执行 pnpm 安装脚本
+                try {
+                    & $pnpmScript
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Log "SUCCESS" ""
+                        Write-Log "SUCCESS" "通过 pnpm 方式安装成功！"
+                        Write-Log "SUCCESS" ""
+                        $installSuccess = $true
+                    } else {
+                        throw "pnpm 安装失败"
+                    }
+                } catch {
+                    Write-Log "ERROR" "pnpm 安装也失败了: $_"
+                    Write-Log "INFO" ""
+                    Write-Log "INFO" "建议手动安装："
+                    Write-Log "INFO" "1. 安装 Node.js: https://nodejs.org/"
+                    Write-Log "INFO" "2. 安装 pnpm: npm install -g pnpm"
+                    Write-Log "INFO" "3. 安装 Claude: pnpm add -g @anthropic-ai/claude"
+                }
+            } else {
+                Write-Log "WARN" "未找到 pnpm.ps1 脚本，无法自动回退。"
+                Write-Log "INFO" (Get-Message "BinaryLocation" $binaryPath)
+            }
+        }
+        
+        if (-not $installSuccess) {
+            $logFile = Save-Log
+            Write-Log "INFO" (Get-Message "LogSaved" $logFile)
+            exit 1
+        }
     } finally {
         # 恢复原始错误处理设置
         $ErrorActionPreference = $originalErrorAction
