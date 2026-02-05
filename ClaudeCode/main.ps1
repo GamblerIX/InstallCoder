@@ -21,13 +21,47 @@ $ProgressPreference = 'SilentlyContinue'
 $script:ScriptPath = $MyInvocation.MyCommand.Definition
 $script:ScriptDir = Split-Path -Parent $script:ScriptPath
 
-# 配置常量
-$GCS_BUCKET = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
-$DOWNLOAD_DIR = "$env:USERPROFILE\.claude\downloads"
-$LOG_DIR = "$env:USERPROFILE\.claude\logs"
-$platform = "win32-x64"
+#region 配置常量
+$script:GCS_BUCKET = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
+$script:DOWNLOAD_DIR = "$env:USERPROFILE\.claude\downloads"
+$script:LOG_DIR = "$env:USERPROFILE\.claude\logs"
+$script:Platform = "win32-x64"
+$script:MaxRetryAttempts = 3
+$script:RequestTimeoutSeconds = 30
+#endregion
 
-# 中文字符串资源
+#region 错误类型枚举
+enum InstallErrorType {
+    Network_DNS
+    Network_Timeout
+    Network_Certificate
+    Network_Proxy
+    Network_Other
+    Download_ChecksumMismatch
+    Download_Corrupted
+    Install_Failed
+    System_Not64Bit
+    System_NoPermission
+    Unknown
+}
+#endregion
+
+# 错误信息资源
+$script:ErrorMessages = @{
+    [InstallErrorType]::Network_DNS = "DNS 解析失败，请检查网络连接或更换 DNS 服务器"
+    [InstallErrorType]::Network_Timeout = "连接超时，可能是网络不稳定，建议重试或使用代理"
+    [InstallErrorType]::Network_Certificate = "证书验证失败，将自动尝试 pnpm 安装方式"
+    [InstallErrorType]::Network_Proxy = "代理服务器错误，请检查代理设置"
+    [InstallErrorType]::Network_Other = "网络连接失败，请检查网络环境"
+    [InstallErrorType]::Download_ChecksumMismatch = "文件校验失败，将重新下载"
+    [InstallErrorType]::Download_Corrupted = "文件损坏，将重新下载"
+    [InstallErrorType]::Install_Failed = "安装程序执行失败"
+    [InstallErrorType]::System_Not64Bit = "Claude Code 不支持 32 位 Windows"
+    [InstallErrorType]::System_NoPermission = "权限不足，请以管理员身份运行"
+    [InstallErrorType]::Unknown = "未知错误，请查看日志获取详细信息"
+}
+
+#region 中文字符串资源
 $script:Messages = @{
     "HelpText" = @"
 Claude Code 安装脚本
@@ -87,9 +121,233 @@ Claude Code 安装脚本
 # 日志内容
 $script:LogContent = @()
 
-# 获取消息
+#region 错误处理函数
+
+<#
+.SYNOPSIS
+    分析异常并分类错误类型
+
+.DESCRIPTION
+    根据异常消息内容识别错误类型，返回包含错误类型、建议操作和是否可重试的对象
+
+.PARAMETER Exception
+    捕获到的异常对象
+
+.OUTPUTS
+    [hashtable] 包含 Type, Message, Suggestion, IsRetryable 的错误信息
+#>
+function Resolve-InstallError {
+    [CmdletBinding()]
+    param([object]$Exception)
+
+    # 支持 ErrorRecord 或 Exception 对象
+    $errorSource = $Exception
+    if ($Exception -is [System.Management.Automation.ErrorRecord]) {
+        $errorSource = $Exception.Exception
+    }
+
+    # 如果 Exception 为 null，使用 ErrorRecord 的 ToString()
+    if ($null -eq $errorSource) {
+        $errorSource = [PSCustomObject]@{
+            Message = $Exception.ToString()
+        }
+    }
+
+    $errorInfo = @{
+        Type        = [InstallErrorType]::Unknown
+        Message     = $errorSource.Message
+        Suggestion  = $script:ErrorMessages[[InstallErrorType]::Unknown]
+        IsRetryable = $false
+    }
+
+    $errorMsg = $errorSource.Message.ToLower()
+
+    switch -Regex ($errorMsg) {
+        "could not resolve|dns|name resolution" {
+            $errorInfo.Type        = [InstallErrorType]::Network_DNS
+            $errorInfo.Suggestion  = $script:ErrorMessages[[InstallErrorType]::Network_DNS]
+            $errorInfo.IsRetryable = $true
+        }
+        "timeout|timed out" {
+            $errorInfo.Type        = [InstallErrorType]::Network_Timeout
+            $errorInfo.Suggestion  = $script:ErrorMessages[[InstallErrorType]::Network_Timeout]
+            $errorInfo.IsRetryable = $true
+        }
+        "certificate|ssl|tls|unknown certificate" {
+            $errorInfo.Type        = [InstallErrorType]::Network_Certificate
+            $errorInfo.Suggestion  = $script:ErrorMessages[[InstallErrorType]::Network_Certificate]
+            $errorInfo.IsRetryable = $false
+        }
+        "407|proxy authentication|proxy.*failed" {
+            $errorInfo.Type        = [InstallErrorType]::Network_Proxy
+            $errorInfo.Suggestion  = $script:ErrorMessages[[InstallErrorType]::Network_Proxy]
+            $errorInfo.IsRetryable = $true
+        }
+        "404|not found" {
+            $errorInfo.Type        = [InstallErrorType]::Network_Other
+            $errorInfo.Suggestion  = "资源不存在，可能是版本号错误或已被移除"
+            $errorInfo.IsRetryable = $false
+        }
+        "checksum|hash|verify" {
+            $errorInfo.Type        = [InstallErrorType]::Download_ChecksumMismatch
+            $errorInfo.Suggestion  = $script:ErrorMessages[[InstallErrorType]::Download_ChecksumMismatch]
+            $errorInfo.IsRetryable = $true
+        }
+        "32-bit|x86|not supported" {
+            $errorInfo.Type        = [InstallErrorType]::System_Not64Bit
+            $errorInfo.Suggestion  = $script:ErrorMessages[[InstallErrorType]::System_Not64Bit]
+            $errorInfo.IsRetryable = $false
+        }
+        "access denied|permission|unauthorized" {
+            $errorInfo.Type        = [InstallErrorType]::System_NoPermission
+            $errorInfo.Suggestion  = $script:ErrorMessages[[InstallErrorType]::System_NoPermission]
+            $errorInfo.IsRetryable = $false
+        }
+    }
+
+    return $errorInfo
+}
+
+<#
+.SYNOPSIS
+    显示格式化的错误报告
+
+.DESCRIPTION
+    在控制台显示美观的错误报告，包含错误类型、详情和建议操作
+#>
+function Write-ErrorReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [InstallErrorType]$ErrorType,
+
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [Parameter(Mandatory)]
+        [string]$Suggestion,
+
+        [string]$LogFile
+    )
+
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Red
+    Write-Host "║                    安装失败                              ║" -ForegroundColor Red
+    Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "错误类型: " -NoNewline -ForegroundColor Yellow
+    Write-Host $ErrorType -ForegroundColor White
+    Write-Host ""
+    Write-Host "错误详情:" -ForegroundColor Yellow
+    Write-Host "  $Message" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "建议操作:" -ForegroundColor Yellow
+    Write-Host "  → $Suggestion" -ForegroundColor Cyan
+
+    if ($LogFile -and (Test-Path $LogFile)) {
+        Write-Host ""
+        Write-Host "日志文件: $LogFile" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+}
+
+<#
+.SYNOPSIS
+    执行网络诊断测试
+
+.DESCRIPTION
+    测试 DNS 解析、HTTP 连通性和代理连接状态，帮助排查网络问题
+#>
+function Test-NetworkDiagnostics {
+    [CmdletBinding()]
+    param(
+        [string]$TargetUrl = $script:GCS_BUCKET,
+        [string]$ProxyUrl
+    )
+
+    Write-Log "INFO" "开始网络诊断..."
+    Write-Log "INFO" "目标地址: $TargetUrl"
+
+    $diagnostics = @()
+
+    # 测试 DNS 解析
+    try {
+        $uri        = [Uri]$TargetUrl
+        $hostEntry  = [System.Net.Dns]::GetHostEntry($uri.Host)
+        $ipAddress  = $hostEntry.AddressList[0].IPAddressToString
+        $diagnostics += "✓ DNS 解析成功: $($uri.Host) -> $ipAddress"
+        Write-Log "SUCCESS" "DNS 解析: $($uri.Host) -> $ipAddress"
+    }
+    catch {
+        $diagnostics += "✗ DNS 解析失败: $_"
+        Write-Log "ERROR" "DNS 解析失败: $_"
+    }
+
+    # 测试直接 HTTP 连接
+    try {
+        $response        = Invoke-WebRequest -Uri $TargetUrl -Method Head -TimeoutSec 10 -UseBasicParsing
+        $statusCode      = $response.StatusCode
+        $diagnostics     += "✓ HTTP 连接成功: 状态码 $statusCode"
+        Write-Log "SUCCESS" "HTTP 连接: 状态码 $statusCode"
+    }
+    catch {
+        $diagnostics += "✗ HTTP 连接失败: $_"
+        Write-Log "ERROR" "HTTP 连接失败: $_"
+    }
+
+    # 测试代理连接（如果提供了代理）
+    if ($ProxyUrl) {
+        try {
+            $response        = Invoke-WebRequest -Uri $TargetUrl -Method Head -TimeoutSec 10 -Proxy $ProxyUrl -UseBasicParsing
+            $statusCode      = $response.StatusCode
+            $diagnostics     += "✓ 代理连接成功 ($ProxyUrl): 状态码 $statusCode"
+            Write-Log "SUCCESS" "代理连接 ($ProxyUrl): 状态码 $statusCode"
+        }
+        catch {
+            $diagnostics += "✗ 代理连接失败 ($ProxyUrl): $_"
+            Write-Log "ERROR" "代理连接失败 ($ProxyUrl): $_"
+        }
+    }
+
+    # 测试系统代理
+    $systemProxy = Get-SystemProxy
+    if ($systemProxy -and $systemProxy -ne $ProxyUrl) {
+        try {
+            $response        = Invoke-WebRequest -Uri $TargetUrl -Method Head -TimeoutSec 10 -Proxy $systemProxy -UseBasicParsing
+            $statusCode      = $response.StatusCode
+            $diagnostics     += "✓ 系统代理连接成功 ($systemProxy): 状态码 $statusCode"
+            Write-Log "SUCCESS" "系统代理 ($systemProxy): 状态码 $statusCode"
+        }
+        catch {
+            $diagnostics += "✗ 系统代理连接失败 ($systemProxy): $_"
+            Write-Log "WARN" "系统代理连接失败 ($systemProxy)"
+        }
+    }
+
+    Write-Log "INFO" "网络诊断完成"
+    return $diagnostics
+}
+
+#endregion
+
+#region 日志和工具函数
+
+<#
+.SYNOPSIS
+    获取本地化消息
+
+.DESCRIPTION
+    从消息资源字典中获取指定键的消息，支持格式化参数
+#>
 function Get-Message {
-    param([string]$Key, [string[]]$FormatArgs)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Key,
+
+        [string[]]$FormatArgs
+    )
+
     $message = $script:Messages[$Key]
     if ($FormatArgs) {
         $message = $message -f $FormatArgs
@@ -97,130 +355,244 @@ function Get-Message {
     return $message
 }
 
-# 写入日志
+<#
+.SYNOPSIS
+    写入日志并输出到控制台
+
+.DESCRIPTION
+    将日志写入内存缓冲区，同时根据级别输出到控制台（带颜色）
+#>
 function Write-Log {
+    [CmdletBinding()]
     param(
+        [Parameter(Mandatory)]
+        [ValidateSet("INFO", "WARN", "ERROR", "SUCCESS")]
         [string]$Level,
+
+        [Parameter(Mandatory)]
         [string]$Message
     )
+
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logEntry = "[$timestamp] [$Level] $Message"
+    $logEntry  = "[$timestamp] [$Level] $Message"
     $script:LogContent += $logEntry
 
     # 同时输出到控制台
     switch ($Level) {
-        "ERROR" { Write-Host $Message -ForegroundColor Red }
-        "WARN" { Write-Host $Message -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $Message -ForegroundColor Red }
+        "WARN"    { Write-Host $Message -ForegroundColor Yellow }
         "SUCCESS" { Write-Host $Message -ForegroundColor Green }
-        default { Write-Host $Message }
+        default   { Write-Host $Message }
     }
 }
 
-# 保存日志
+<#
+.SYNOPSIS
+    保存日志到文件
+
+.DESCRIPTION
+    将内存中的日志内容保存到日志目录
+
+.OUTPUTS
+    [string] 日志文件的完整路径
+#>
 function Save-Log {
-    New-Item -ItemType Directory -Force -Path $LOG_DIR | Out-Null
-    $logFile = Join-Path $LOG_DIR "install-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+    [CmdletBinding()]
+    param()
+
+    New-Item -ItemType Directory -Force -Path $script:LOG_DIR | Out-Null
+
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $logFile   = Join-Path $script:LOG_DIR "install-$timestamp.log"
+
     $script:LogContent | Out-File -FilePath $logFile -Encoding UTF8
+
     return $logFile
 }
 
-# 安全删除文件（使用 .NET 方法避免 PowerShell 别名冲突）
+<#
+.SYNOPSIS
+    安全删除文件
+
+.DESCRIPTION
+    使用 .NET 方法安全删除文件，避免 PowerShell 别名冲突
+#>
 function Remove-FileSafe {
-    param([string]$Path)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
     try {
         if (Test-Path $Path) {
             [System.IO.File]::Delete($Path)
         }
-    } catch {
+    }
+    catch {
         Write-Log "WARN" "无法删除文件: $Path - $_"
     }
-    # 不返回任何值，避免输出到控制台
 }
 
-# 刷新环境变量
+#endregion
+
+#region 环境管理和安装函数
+
+<#
+.SYNOPSIS
+    刷新当前会话的环境变量
+
+.DESCRIPTION
+    从注册表重新加载 Machine 和 User 级别的环境变量到当前会话
+#>
 function Update-EnvironmentVariables {
+    [CmdletBinding()]
+    param()
+
     Write-Log "INFO" "正在刷新环境变量..."
-    
-    # 重新加载 Machine 和 User 级别的环境变量
+
     foreach ($level in "Machine", "User") {
         [Environment]::GetEnvironmentVariables($level).GetEnumerator() | ForEach-Object {
-            $name = $_.Key
-            $value = $_.Value
-            Set-Item -Path Env:$name -Value $value
+            $envVariableName  = $_.Key
+            $envVariableValue = $_.Value
+            Set-Item -Path "Env:$envVariableName" -Value $envVariableValue
         }
     }
-    
+
     Write-Log "INFO" "环境变量已刷新"
 }
 
-# 执行原生 Claude Code 安装（通过 pnpm 安装的 claude）
+<#
+.SYNOPSIS
+    执行原生 Claude Code 安装
+
+.DESCRIPTION
+    通过 pnpm 安装的 claude 命令执行原生安装
+
+.OUTPUTS
+    [bool] 是否安装成功
+#>
 function Install-NativeClaude {
+    [CmdletBinding()]
+    param()
+
     Write-Log "INFO" "正在安装原生 Claude Code..."
-    
+
     try {
         # 刷新环境变量确保能找到 claude 命令
         Update-EnvironmentVariables
-        
+
         # 检查 claude 命令是否可用
-        $claudePath = Get-Command "claude" -ErrorAction SilentlyContinue
-        
-        if (-not $claudePath) {
-            # 尝试从 pnpm 全局目录查找
+        $claudeCommand = Get-Command "claude" -ErrorAction SilentlyContinue
+
+        # 如果 PATH 中找不到，尝试从 pnpm 全局目录查找
+        if (-not $claudeCommand) {
             $pnpmGlobalDir = & pnpm root -g 2>$null
             if ($pnpmGlobalDir) {
-                $claudeExe = Join-Path $pnpmGlobalDir ".bin\claude.cmd"
-                if (Test-Path $claudeExe) {
-                    $claudePath = @{ Source = $claudeExe }
+                $claudeExePath = Join-Path $pnpmGlobalDir ".bin\claude.cmd"
+                if (Test-Path $claudeExePath) {
+                    $claudeCommand = @{ Source = $claudeExePath }
                 }
             }
         }
-        
-        if ($claudePath) {
-            Write-Log "INFO" "找到 Claude: $($claudePath.Source)"
+
+        if ($claudeCommand) {
+            Write-Log "INFO" "找到 Claude: $($claudeCommand.Source)"
             Write-Log "INFO" "尝试安装原生 Claude Code..."
 
             # 执行 claude install 安装原生版本
-            & $claudePath.Source install --force
-            
-            if ($LASTEXITCODE -eq 0) {
+            & $claudeCommand.Source install --force
+
+            $isSuccessful = ($LASTEXITCODE -eq 0)
+
+            if ($isSuccessful) {
                 Write-Log "SUCCESS" "原生 Claude Code 安装成功！"
-                return $true
-            } else {
-                Write-Log "WARN" "原生安装返回退出代码: $LASTEXITCODE"
-                return $false
             }
-        } else {
+            else {
+                Write-Log "WARN" "原生安装返回退出代码: $LASTEXITCODE"
+            }
+
+            return $isSuccessful
+        }
+        else {
             Write-Log "WARN" "无法找到 claude 命令，跳过原生安装"
             return $false
         }
-    } catch {
+    }
+    catch {
         Write-Log "WARN" "原生安装失败: $_"
         return $false
     }
 }
 
-# 获取系统代理
+#region 代理和网络函数
+
+<#
+.SYNOPSIS
+    获取系统代理设置
+
+.DESCRIPTION
+    从 Windows 系统设置中获取代理服务器地址
+
+.OUTPUTS
+    [string] 代理地址，如果没有设置则返回 $null
+#>
 function Get-SystemProxy {
+    [CmdletBinding()]
+    param()
+
     try {
-        $proxy = [System.Net.WebRequest]::GetSystemWebProxy()
-        $proxyUrl = $proxy.GetProxy($GCS_BUCKET)
-        if ($proxyUrl -and $proxyUrl.AbsoluteUri -ne $GCS_BUCKET) {
-            return $proxyUrl.AbsoluteUri
+        $systemWebProxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $proxyUri       = $systemWebProxy.GetProxy($script:GCS_BUCKET)
+
+        $hasProxy = $proxyUri -and $proxyUri.AbsoluteUri -ne $script:GCS_BUCKET
+        if ($hasProxy) {
+            return $proxyUri.AbsoluteUri
         }
-    } catch {
+    }
+    catch {
         Write-Log "WARN" "获取系统代理失败: $_"
     }
+
     return $null
 }
 
-# 获取环境变量代理
+<#
+.SYNOPSIS
+    获取环境变量中的代理设置
+
+.DESCRIPTION
+    检查 HTTP_PROXY、HTTPS_PROXY 等环境变量
+
+.OUTPUTS
+    [string] 代理地址，如果没有设置则返回 $null
+#>
 function Get-EnvironmentProxy {
-    $envProxy = $env:HTTP_PROXY -or $env:http_proxy -or $env:HTTPS_PROXY -or $env:https_proxy
-    return $envProxy
+    [CmdletBinding()]
+    param()
+
+    $environmentProxy = $env:HTTP_PROXY -or
+                        $env:http_proxy -or
+                        $env:HTTPS_PROXY -or
+                        $env:https_proxy
+
+    return $environmentProxy
 }
 
-# 确定要使用的代理
+<#
+.SYNOPSIS
+    确定要使用的代理（优先级：参数 > 环境变量 > 系统设置）
+
+.DESCRIPTION
+    按优先级顺序检测并返回可用的代理服务器地址
+
+.OUTPUTS
+    [string] 代理地址，如果没有找到则返回 $null
+#>
 function Get-ProxyToUse {
+    [CmdletBinding()]
+    param()
+
     # 1. 优先使用参数指定的代理
     if ($Proxy) {
         Write-Log "INFO" (Get-Message "UsingExplicitProxy" $Proxy)
@@ -228,10 +600,10 @@ function Get-ProxyToUse {
     }
 
     # 2. 检查环境变量代理
-    $envProxy = Get-EnvironmentProxy
-    if ($envProxy) {
-        Write-Log "INFO" (Get-Message "UsingEnvProxy" $envProxy)
-        return $envProxy
+    $environmentProxy = Get-EnvironmentProxy
+    if ($environmentProxy) {
+        Write-Log "INFO" (Get-Message "UsingEnvProxy" $environmentProxy)
+        return $environmentProxy
     }
 
     # 3. 检查系统代理
@@ -244,157 +616,438 @@ function Get-ProxyToUse {
     return $null
 }
 
-# 创建 Web 请求选项
+<#
+.SYNOPSIS
+    创建 Web 请求的选项哈希表
+
+.DESCRIPTION
+    创建包含超时和代理设置的请求选项
+
+.PARAMETER ProxyUrl
+    可选的代理地址
+
+.OUTPUTS
+    [hashtable] 请求选项
+#>
 function New-WebRequestOptions {
+    [CmdletBinding()]
     param([string]$ProxyUrl)
 
-    $options = @{
-        TimeoutSec = 30
+    $requestOptions = @{
+        TimeoutSec  = $script:RequestTimeoutSeconds
         ErrorAction = "Stop"
     }
 
     if ($ProxyUrl) {
-        $options['Proxy'] = $ProxyUrl
+        $requestOptions['Proxy'] = $ProxyUrl
     }
 
-    return $options
+    return $requestOptions
 }
 
-# 测试 GCS 连通性
+<#
+.SYNOPSIS
+    测试 Google Cloud Storage 连通性
+
+.DESCRIPTION
+    测试能否访问 GCS 获取版本信息
+
+.PARAMETER ProxyUrl
+    可选的代理地址
+
+.OUTPUTS
+    [bool] 是否可连通
+#>
 function Test-GCSConnectivity {
+    [CmdletBinding()]
     param([string]$ProxyUrl)
 
     try {
-        $options = New-WebRequestOptions -ProxyUrl $ProxyUrl
-        $null = Invoke-RestMethod -Uri "$GCS_BUCKET/latest" @options
+        $requestOptions = New-WebRequestOptions -ProxyUrl $ProxyUrl
+        $null = Invoke-RestMethod -Uri "$script:GCS_BUCKET/latest" @requestOptions
         return $true
-    } catch {
+    }
+    catch {
         return $false
     }
 }
 
-# 获取版本信息
+#endregion
+
+#region 版本信息函数
+
+<#
+.SYNOPSIS
+    获取最新版本号
+
+.DESCRIPTION
+    从 GCS 获取 Claude Code 的最新版本号
+
+.PARAMETER ProxyUrl
+    可选的代理地址
+
+.OUTPUTS
+    [string] 版本号（如 "0.2.45"）
+#>
 function Get-VersionInfo {
+    [CmdletBinding()]
     param([string]$ProxyUrl)
 
-    $options = New-WebRequestOptions -ProxyUrl $ProxyUrl
-    $version = Invoke-RestMethod -Uri "$GCS_BUCKET/latest" @options
-    return $version
+    $requestOptions = New-WebRequestOptions -ProxyUrl $ProxyUrl
+    $latestVersion  = Invoke-RestMethod -Uri "$script:GCS_BUCKET/latest" @requestOptions
+
+    return $latestVersion
 }
 
-# 获取清单文件
+<#
+.SYNOPSIS
+    获取版本清单文件
+
+.DESCRIPTION
+    从 GCS 获取指定版本的清单文件，包含校验和等信息
+
+.PARAMETER Version
+    版本号
+
+.PARAMETER ProxyUrl
+    可选的代理地址
+
+.OUTPUTS
+    [PSCustomObject] 清单文件对象
+#>
 function Get-Manifest {
+    [CmdletBinding()]
     param(
+        [Parameter(Mandatory)]
         [string]$Version,
+
         [string]$ProxyUrl
     )
 
-    $options = New-WebRequestOptions -ProxyUrl $ProxyUrl
-    $manifest = Invoke-RestMethod -Uri "$GCS_BUCKET/$Version/manifest.json" @options
+    $requestOptions = New-WebRequestOptions -ProxyUrl $ProxyUrl
+    $manifestUrl    = "$script:GCS_BUCKET/$Version/manifest.json"
+    $manifest       = Invoke-RestMethod -Uri $manifestUrl @requestOptions
+
     return $manifest
 }
 
-# 下载文件
+#endregion
+
+#region 下载函数
+
+<#
+.SYNOPSIS
+    下载文件并显示进度条
+
+.DESCRIPTION
+    从指定 URL 下载文件，显示下载进度，支持代理和重试
+
+.PARAMETER Url
+    要下载的文件 URL
+
+.PARAMETER OutFile
+    保存路径
+
+.PARAMETER ProxyUrl
+    可选的代理地址
+
+.PARAMETER Description
+    进度条显示的描述文本
+
+.PARAMETER MaxRetryAttempts
+    最大重试次数（默认3次）
+#>
 function Download-File {
+    [CmdletBinding()]
     param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$Url,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$OutFile,
-        [string]$ProxyUrl
+
+        [string]$ProxyUrl,
+
+        [string]$Description = "正在下载",
+
+        [ValidateRange(1, 10)]
+        [int]$MaxRetryAttempts = $script:MaxRetryAttempts
     )
 
-    $options = New-WebRequestOptions -ProxyUrl $ProxyUrl
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile @options
+    $currentRetryAttempt = 0
+    $isDownloadSuccessful = $false
+
+    while ($currentRetryAttempt -lt $MaxRetryAttempts -and -not $isDownloadSuccessful) {
+        try {
+            if ($currentRetryAttempt -gt 0) {
+                # 指数退避策略
+                $delaySeconds = [Math]::Pow(2, $currentRetryAttempt)
+                Write-Log "INFO" "第 $currentRetryAttempt/$MaxRetryAttempts 次重试，等待 ${delaySeconds}秒..."
+                Start-Sleep -Seconds $delaySeconds
+            }
+
+            Invoke-DownloadWithProgress -Url $Url `
+                -OutFile $OutFile `
+                -ProxyUrl $ProxyUrl `
+                -Description $Description
+
+            $isDownloadSuccessful = $true
+            Write-Log "SUCCESS" "下载完成: $([IO.Path]::GetFileName($OutFile))"
+        }
+        catch {
+            $currentRetryAttempt++
+            $errorInfo = Resolve-InstallError -Exception $_.Exception
+
+            Write-Log "WARN" "下载失败 ($currentRetryAttempt/$MaxRetryAttempts): $($errorInfo.Message)"
+
+            if (-not $errorInfo.IsRetryable -or $currentRetryAttempt -eq $MaxRetryAttempts) {
+                throw $_
+            }
+
+            # 清理失败的文件
+            Remove-FileSafe -Path $OutFile
+        }
+    }
+
+    return $isDownloadSuccessful
 }
 
-# 获取已安装的 Claude Code 版本
-function Get-InstalledClaudeVersion {
+<#
+.SYNOPSIS
+    内部函数：执行带进度条的下载
+
+.DESCRIPTION
+    使用 WebClient 实现异步下载并显示进度条
+#>
+function Invoke-DownloadWithProgress {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Url,
+
+        [Parameter(Mandatory)]
+        [string]$OutFile,
+
+        [string]$ProxyUrl,
+
+        [string]$Description
+    )
+
+    # 确保输出目录存在
+    $outputDirectory = Split-Path -Parent $OutFile
+    if (-not (Test-Path $outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
+
+    # 创建 WebClient
+    $webClient = New-Object System.Net.WebClient
+
+    # 配置代理
+    if ($ProxyUrl) {
+        $proxy = New-Object System.Net.WebProxy($ProxyUrl)
+        $webClient.Proxy = $proxy
+    }
+
+    $script:lastReportedPercent = -1
+
+    # 注册进度事件
+    $progressHandler = {
+        $percent = $EventArgs.ProgressPercentage
+        $downloadedBytes = $EventArgs.BytesReceived
+        $totalBytes = $EventArgs.TotalBytesToReceive
+
+        # 每 5% 更新一次，减少闪烁
+        if ($percent -ne $script:lastReportedPercent -and $percent % 5 -eq 0) {
+            $script:lastReportedPercent = $percent
+            $downloadedMB = [math]::Round($downloadedBytes / 1MB, 2)
+            $totalMB = [math]::Round($totalBytes / 1MB, 2)
+
+            Write-Progress -Activity $Event.MessageData `
+                -Status "$percent% 完成" `
+                -PercentComplete $percent `
+                -CurrentOperation "$downloadedMB MB / $totalMB MB"
+        }
+    }
+
+    $completedHandler = {
+        Write-Progress -Activity $Event.MessageData -Completed
+    }
+
+    $progressEvent = Register-ObjectEvent -InputObject $webClient `
+        -EventName DownloadProgressChanged `
+        -Action $progressHandler `
+        -MessageData $Description
+
+    $completedEvent = Register-ObjectEvent -InputObject $webClient `
+        -EventName DownloadFileCompleted `
+        -Action $completedHandler `
+        -MessageData $Description
+
     try {
-        # 尝试从常见位置查找 claude 命令
-        $claudePath = $null
-        
+        # 开始异步下载
+        $webClient.DownloadFileAsync($Url, $OutFile)
+
+        # 等待下载完成
+        while ($webClient.IsBusy) {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    finally {
+        # 清理事件和对象
+        Unregister-Event -SourceIdentifier $progressEvent.Name -ErrorAction SilentlyContinue
+        Unregister-Event -SourceIdentifier $completedEvent.Name -ErrorAction SilentlyContinue
+        $webClient.Dispose()
+        Write-Progress -Activity $Description -Completed
+    }
+}
+
+#endregion
+
+#region 版本检测和比较函数
+
+<#
+.SYNOPSIS
+    获取已安装的 Claude Code 版本
+
+.DESCRIPTION
+    从 PATH 或默认安装位置查找已安装的 Claude Code 并获取其版本号
+
+.OUTPUTS
+    [string] 版本号，如果未安装则返回 $null
+#>
+function Get-InstalledClaudeVersion {
+    [CmdletBinding()]
+    param()
+
+    try {
+        # 可能的安装路径
+        $possiblePaths = @()
+
         # 检查 PATH 中的 claude
         $claudeInPath = Get-Command "claude" -ErrorAction SilentlyContinue
         if ($claudeInPath) {
-            $claudePath = $claudeInPath.Source
+            $possiblePaths += $claudeInPath.Source
         }
-        
+
         # 检查默认安装位置
-        $defaultPaths = @(
-            "$env:LOCALAPPDATA\Programs\Claude\claude.exe",
-            "$env:ProgramFiles\Claude\claude.exe",
-            "$env:ProgramFiles(x86)\Claude\claude.exe",
+        $defaultInstallPaths = @(
+            "$env:LOCALAPPDATA\Programs\Claude\claude.exe"
+            "$env:ProgramFiles\Claude\claude.exe"
             "$env:USERPROFILE\AppData\Local\Programs\Claude\claude.exe"
         )
-        
-        foreach ($path in $defaultPaths) {
-            if (Test-Path $path) {
-                $claudePath = $path
-                break
-            }
-        }
-        
-        if (-not $claudePath) {
+        $possiblePaths += $defaultInstallPaths
+
+        # 查找第一个存在的路径
+        $claudeExecutablePath = $possiblePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+        if (-not $claudeExecutablePath) {
             return $null
         }
-        
-        # 尝试获取版本信息
-        # 使用 --version 参数或其他方式
-        $versionOutput = & $claudePath --version 2>$null
-        if ($versionOutput -match '(\d+\.\d+\.\d+)') {
+
+        # 尝试通过 --version 获取版本
+        $versionOutput = & $claudeExecutablePath --version 2>$null
+        $versionPattern = '(\d+\.\d+\.\d+)'
+
+        if ($versionOutput -match $versionPattern) {
             return $matches[1]
         }
-        
-        # 如果 --version 失败, 尝试从文件版本获取
-        $fileVersion = (Get-ItemProperty $claudePath).VersionInfo.FileVersion
-        if ($fileVersion) {
-            return $fileVersion
+
+        # 回退到文件版本信息
+        $fileVersionInfo = (Get-ItemProperty $claudeExecutablePath).VersionInfo.FileVersion
+        if ($fileVersionInfo) {
+            return $fileVersionInfo
         }
-        
+
         return $null
-    } catch {
+    }
+    catch {
         return $null
     }
 }
 
-# 比较版本号
+<#
+.SYNOPSIS
+    比较两个版本号
+
+.DESCRIPTION
+    比较两个版本号，返回比较结果
+
+.PARAMETER InstalledVersion
+    已安装的版本
+
+.PARAMETER TargetVersion
+    目标版本
+
+.OUTPUTS
+    [int] 1 (Installed > Target), 0 (相等), -1 (Installed < Target)
+#>
 function Compare-Version {
+    [CmdletBinding()]
     param(
-        [string]$Version1,
-        [string]$Version2
+        [Parameter(Mandatory)]
+        [string]$InstalledVersion,
+
+        [Parameter(Mandatory)]
+        [string]$TargetVersion
     )
-    
+
     try {
-        $v1 = [System.Version]$Version1
-        $v2 = [System.Version]$Version2
-        
-        if ($v1 -gt $v2) {
+        $parsedInstalledVersion = [System.Version]$InstalledVersion
+        $parsedTargetVersion    = [System.Version]$TargetVersion
+
+        if ($parsedInstalledVersion -gt $parsedTargetVersion) {
             return 1
-        } elseif ($v1 -lt $v2) {
+        }
+        elseif ($parsedInstalledVersion -lt $parsedTargetVersion) {
             return -1
-        } else {
+        }
+        else {
             return 0
         }
-    } catch {
-        # 如果无法解析版本, 假设需要更新
+    }
+    catch {
+        # 如果无法解析版本，假设需要更新（返回 -1）
+        Write-Log "WARN" "无法解析版本号，假设需要更新"
         return -1
     }
 }
 
-# 主安装流程
+#endregion
+
+<#
+.SYNOPSIS
+    主安装流程
+
+.DESCRIPTION
+    执行完整的 Claude Code 安装流程，包括网络检测、版本检查、下载、校验和安装
+#>
 function Install-ClaudeCode {
-    # 检查 32 位系统
-    if (-not [Environment]::Is64BitProcess) {
-        Write-Log "ERROR" (Get-Message "Error32Bit")
+    [CmdletBinding()]
+    param()
+
+    #region 系统检查
+    # 检查 64 位系统
+    $is64BitProcess = [Environment]::Is64BitProcess
+    if (-not $is64BitProcess) {
+        $errorInfo = Resolve-InstallError -Exception ([System.Exception]::new("32-bit system not supported"))
+        $logFile     = Save-Log
+        Write-ErrorReport -ErrorType $errorInfo.Type `
+            -Message $errorInfo.Message `
+            -Suggestion $errorInfo.Suggestion `
+            -LogFile $logFile
         exit 1
     }
 
     # 创建下载目录
-    New-Item -ItemType Directory -Force -Path $DOWNLOAD_DIR | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:DOWNLOAD_DIR | Out-Null
+    #endregion
 
-    # 确定要使用的代理
-    $proxyToUse = Get-ProxyToUse
+    #region 网络和代理配置
+    $proxyToUse         = Get-ProxyToUse
+    $networkDiagnostics = @()
 
-    # 检测网络环境
     Write-Log "INFO" (Get-Message "CheckingNetwork")
     $canConnectDirectly = Test-GCSConnectivity
 
@@ -402,272 +1055,317 @@ function Install-ClaudeCode {
         Write-Log "WARN" (Get-Message "GCSNotAccessible")
 
         if (-not $proxyToUse) {
-            # 没有代理可用，显示帮助信息
-            Write-Log "ERROR" (Get-Message "ErrorNetwork")
-            Write-Log "INFO" (Get-Message "SuggestionProxy")
-            Write-Log "INFO" (Get-Message "SuggestionVPN")
-            Write-Log "INFO" ""
-            Write-Log "INFO" "Clash:    .\main.ps1 -Proxy 'http://127.0.0.1:7890'"
-            Write-Log "INFO" "v2rayN:   .\main.ps1 -Proxy 'http://127.0.0.1:10809'"
+            # 执行网络诊断
+            $networkDiagnostics = Test-NetworkDiagnostics
 
             $logFile = Save-Log
-            Write-Log "INFO" (Get-Message "LogSaved" $logFile)
+            Write-ErrorReport -ErrorType ([InstallErrorType]::Network_Other) `
+                -Message "无法连接到 Google Cloud Storage" `
+                -Suggestion "请配置代理后重试。常用代理: Clash (7890), v2rayN (10809)" `
+                -LogFile $logFile
+
+            Write-Log "INFO" ""
+            Write-Log "INFO" "使用示例:"
+            Write-Log "INFO" "  Clash:  .\main.ps1 -Proxy 'http://127.0.0.1:7890'"
+            Write-Log "INFO" "  v2rayN: .\main.ps1 -Proxy 'http://127.0.0.1:10809'"
             exit 1
         }
 
         Write-Log "INFO" (Get-Message "TryingProxy")
     }
+    #endregion
 
-    # 获取版本信息
+    #region 获取版本信息
     Write-Log "INFO" (Get-Message "FetchingVersion")
-    $version = $null
-    $manifest = $null
-    $checksum = $null
 
-    $maxRetries = 3
-    $retryCount = 0
-    $success = $false
+    $targetVersion      = $null
+    $versionManifest    = $null
+    $expectedChecksum   = $null
+    $currentAttempt     = 0
+    $isVersionFetched   = $false
 
-    while ($retryCount -lt $maxRetries -and -not $success) {
+    while ($currentAttempt -lt $script:MaxRetryAttempts -and -not $isVersionFetched) {
         try {
-            if ($retryCount -gt 0) {
-                Write-Log "INFO" (Get-Message "Retrying" ($retryCount + 1), $maxRetries)
+            if ($currentAttempt -gt 0) {
+                Write-Log "INFO" (Get-Message "Retrying" ($currentAttempt + 1), $script:MaxRetryAttempts)
                 Start-Sleep -Seconds 2
             }
 
-            $version = Get-VersionInfo -ProxyUrl $proxyToUse
-            $manifest = Get-Manifest -Version $version -ProxyUrl $proxyToUse
-            $checksum = $manifest.platforms.$platform.checksum
+            $targetVersion    = Get-VersionInfo -ProxyUrl $proxyToUse
+            $versionManifest  = Get-Manifest -Version $targetVersion -ProxyUrl $proxyToUse
+            $expectedChecksum = $versionManifest.platforms.$script:Platform.checksum
 
-            if (-not $checksum) {
-                throw "Platform $platform not found in manifest"
+            if (-not $expectedChecksum) {
+                throw "Platform $script:Platform not found in manifest"
             }
 
-            $success = $true
-        } catch {
-            $retryCount++
-            Write-Log "WARN" "尝试 $retryCount 失败: $_"
+            $isVersionFetched = $true
+            Write-Log "SUCCESS" "获取版本信息成功: $targetVersion"
+        }
+        catch {
+            $currentAttempt++
+            $errorInfo = Resolve-InstallError -Exception $_.Exception
+            Write-Log "WARN" "获取版本失败 ($currentAttempt/$($script:MaxRetryAttempts)): $($errorInfo.Message)"
 
-            if ($retryCount -eq $maxRetries) {
-                Write-Log "ERROR" (Get-Message "ErrorNetwork")
-                Write-Log "ERROR" (Get-Message "AllAttemptsFailed")
-
-                if ($proxyToUse) {
-                    Write-Log "INFO" (Get-Message "SuggestionCheckProxy")
-                } else {
-                    Write-Log "INFO" (Get-Message "SuggestionProxy")
-                }
-
+            if ($currentAttempt -eq $script:MaxRetryAttempts) {
                 $logFile = Save-Log
-                Write-Log "INFO" (Get-Message "LogSaved" $logFile)
+                Write-ErrorReport -ErrorType $errorInfo.Type `
+                    -Message $errorInfo.Message `
+                    -Suggestion $errorInfo.Suggestion `
+                    -LogFile $logFile
                 exit 1
             }
         }
     }
+    #endregion
 
-    # 检查已安装的版本
-    $installedVersion = Get-InstalledClaudeVersion
+    #region 检查已安装版本
+    $installedVersion     = Get-InstalledClaudeVersion
+    $shouldSkipInstall    = $false
+
     if ($installedVersion) {
-        $comparison = Compare-Version -Version1 $installedVersion -Version2 $version
-        
-        if ($comparison -ge 0 -and -not $Force) {
-            # 已安装版本相同或更新, 且没有强制安装
+        $versionComparison    = Compare-Version -Version1 $installedVersion -Version2 $targetVersion
+        $isUpToDate           = $versionComparison -ge 0
+        $shouldSkipInstall    = $isUpToDate -and -not $Force
+
+        if ($shouldSkipInstall) {
             Write-Log "SUCCESS" ""
             Write-Log "SUCCESS" (Get-Message "AlreadyInstalled" $installedVersion)
             Write-Log "SUCCESS" ""
             Write-Log "INFO" "使用 -Force 参数可以强制重新安装。"
             exit 0
-        } elseif ($comparison -ge 0 -and $Force) {
+        }
+        elseif ($isUpToDate -and $Force) {
             Write-Log "INFO" (Get-Message "AlreadyInstalledWithForce" $installedVersion)
         }
     }
+    #endregion
 
-    # 检查本地是否已有该版本的文件
-    $binaryPath = "$DOWNLOAD_DIR\claude-$version-$platform.exe"
-    $needsDownload = $true
-    
-    if (Test-Path $binaryPath) {
-        # 检查文件校验和
+    #region 检查本地缓存
+    $installerFileName    = "claude-$targetVersion-$script:Platform.exe"
+    $installerPath        = Join-Path $script:DOWNLOAD_DIR $installerFileName
+    $needsDownload        = $true
+
+    if (Test-Path $installerPath) {
         try {
-            $existingChecksum = (Get-FileHash -Path $binaryPath -Algorithm SHA256).Hash.ToLower()
-            if ($existingChecksum -eq $checksum) {
-                Write-Log "INFO" "本地已存在版本 $version 的文件且校验通过, 跳过下载。"
+            $localChecksum    = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash.ToLower()
+            $isCacheValid     = $localChecksum -eq $expectedChecksum
+
+            if ($isCacheValid) {
+                Write-Log "INFO" "本地已缓存版本 $targetVersion 且校验通过，跳过下载。"
                 $needsDownload = $false
-            } else {
-                Write-Log "WARN" "本地文件校验和不匹配, 重新下载。"
-                Remove-FileSafe -Path $binaryPath
             }
-        } catch {
-            Write-Log "WARN" "无法验证本地文件, 重新下载。"
-            Remove-FileSafe -Path $binaryPath
+            else {
+                Write-Log "WARN" "本地缓存文件校验失败，将重新下载。"
+                Remove-FileSafe -Path $installerPath
+            }
+        }
+        catch {
+            Write-Log "WARN" "无法验证本地缓存，将重新下载。"
+            Remove-FileSafe -Path $installerPath
         }
     }
+    #endregion
 
-    # 下载二进制文件（如果需要）
+    #region 下载安装程序
     if ($needsDownload) {
         Write-Log "INFO" (Get-Message "Downloading")
-        
-        $retryCount = 0
-        $success = $false
 
-        while ($retryCount -lt $maxRetries -and -not $success) {
-            try {
-                if ($retryCount -gt 0) {
-                    Write-Log "INFO" (Get-Message "Retrying" ($retryCount + 1), $maxRetries)
-                    Start-Sleep -Seconds 2
-                }
+        $downloadUrl = "$script:GCS_BUCKET/$targetVersion/$script:Platform/claude.exe"
 
-                Download-File -Url "$GCS_BUCKET/$version/$platform/claude.exe" -OutFile $binaryPath -ProxyUrl $proxyToUse
-                $success = $true
-            } catch {
-                $retryCount++
-                Write-Log "WARN" "下载尝试 $retryCount 失败: $_"
+        try {
+            Download-File -Url $downloadUrl `
+                -OutFile $installerPath `
+                -ProxyUrl $proxyToUse `
+                -Description "正在下载 Claude Code $targetVersion" `
+                -MaxRetryAttempts $script:MaxRetryAttempts
+        }
+        catch {
+            $errorInfo = Resolve-InstallError -Exception $_.Exception.Exception
+            $logFile    = Save-Log
 
-                Remove-FileSafe -Path $binaryPath
-
-                if ($retryCount -eq $maxRetries) {
-                    Write-Log "ERROR" (Get-Message "ErrorDownload")
-                    Write-Log "ERROR" $_
-
-                    $logFile = Save-Log
-                    Write-Log "INFO" (Get-Message "LogSaved" $logFile)
-                    exit 1
-                }
-            }
+            Write-ErrorReport -ErrorType $errorInfo.Type `
+                -Message $errorInfo.Message `
+                -Suggestion $errorInfo.Suggestion `
+                -LogFile $logFile
+            exit 1
         }
     }
+    #endregion
 
-    # 验证校验和
+    #region 验证文件完整性
     Write-Log "INFO" (Get-Message "Verifying")
-    $actualChecksum = (Get-FileHash -Path $binaryPath -Algorithm SHA256).Hash.ToLower()
 
-    if ($actualChecksum -ne $checksum) {
-        Write-Log "ERROR" (Get-Message "ErrorVerify")
-        Remove-FileSafe -Path $binaryPath
+    $actualChecksum   = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash.ToLower()
+    $isChecksumValid  = $actualChecksum -eq $expectedChecksum
 
+    if (-not $isChecksumValid) {
+        Remove-FileSafe -Path $installerPath
         $logFile = Save-Log
-        Write-Log "INFO" (Get-Message "LogSaved" $logFile)
+
+        Write-ErrorReport -ErrorType ([InstallErrorType]::Download_ChecksumMismatch) `
+            -Message "文件校验失败。期望: $expectedChecksum, 实际: $actualChecksum" `
+            -Suggestion "文件可能损坏或被篡改，已删除缓存，请重试" `
+            -LogFile $logFile
         exit 1
     }
 
-    # 执行安装
+    Write-Log "SUCCESS" "文件校验通过"
+    #endregion
+
+    #region 执行安装
     Write-Log "INFO" (Get-Message "Installing")
-    $installSuccess = $false
-    
-    # 保存当前环境变量状态
-    $originalErrorAction = $ErrorActionPreference
+
+    $isInstallSuccessful  = $false
+    $originalErrorAction  = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    
+
     try {
-        # 始终添加 --force 参数以尝试绕过证书验证
+        # 构建安装参数
+        $installArguments = @("install", "--force")
         if ($Target -and $Target -ne "latest") {
-            & $binaryPath install $Target --force
-        } else {
-            & $binaryPath install --force
+            $installArguments = @("install", $Target, "--force")
         }
-        
-        # 检查最后一个命令的退出代码
-        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq $null) {
-            $installSuccess = $true
-        } else {
-            throw "Claude Code 安装程序返回退出代码: $LASTEXITCODE"
+
+        # 执行安装程序
+        & $installerPath @installArguments
+
+        $isInstallSuccessful = ($LASTEXITCODE -eq 0) -or ($null -eq $LASTEXITCODE)
+
+        if (-not $isInstallSuccessful) {
+            throw "安装程序返回退出代码: $LASTEXITCODE"
         }
-    } catch {
-        $errorMsg = $_
+    }
+    catch {
+        $installError     = $_
+        # 使用 ErrorRecord 本身（Resolve-InstallError 会处理两种情况）
+        $errorInfo        = Resolve-InstallError -Exception $installError
+        $isCertificateError = $errorInfo.Type -eq [InstallErrorType]::Network_Certificate
+
+        # 如果 Exception 为空，使用错误消息本身
+        $errorMessage = $installError.Exception.Message
+        if ([string]::IsNullOrEmpty($errorMessage)) {
+            $errorMessage = $installError.ToString()
+        }
+
         Write-Log "ERROR" (Get-Message "ErrorInstall")
-        Write-Log "ERROR" $errorMsg
-        
-        # 检查是否是证书验证错误
-        if ($errorMsg -match "certificate verification error" -or 
-            $errorMsg -match "unknown certificate" -or
-            $LASTEXITCODE -eq 1) {
-            
+        Write-Log "ERROR" $errorMessage
+
+        # 证书错误：回退到 pnpm 安装
+        if ($isCertificateError) {
             Write-Log "INFO" ""
             Write-Log "INFO" "检测到证书验证错误，正在尝试使用 pnpm 方式安装..."
             Write-Log "INFO" ""
-            
-            # 获取当前脚本所在目录（使用保存的变量）
-            $pnpmScript = Join-Path $script:ScriptDir "pnpm.ps1"
-            $pnpmUrl = "https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/pnpm.ps1"
-            
-            # 检查 pnpm.ps1 是否存在，如果不存在则下载
-            if (-not (Test-Path $pnpmScript)) {
-                Write-Log "INFO" "本地未找到 pnpm.ps1，正在从 GitHub 下载..."
-                try {
-                    Invoke-WebRequest -Uri $pnpmUrl -OutFile $pnpmScript -UseBasicParsing
-                    Write-Log "SUCCESS" "pnpm.ps1 下载完成"
-                } catch {
-                    Write-Log "ERROR" "下载 pnpm.ps1 失败: $_"
-                }
-            }
-            
-            # 检查 pnpm.ps1 是否存在（下载后再次检查）
-            if (Test-Path $pnpmScript) {
-                Write-Log "INFO" "正在调用 pnpm 安装脚本..."
-                
-                # 清理当前下载的文件
-                Remove-FileSafe -Path $binaryPath
-                
-                # 执行 pnpm 安装脚本
-                try {
-                    & $pnpmScript
-                    
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Log "SUCCESS" ""
-                        Write-Log "SUCCESS" "通过 pnpm 方式安装成功！"
-                        Write-Log "SUCCESS" ""
-                        
-                        # pnpm 安装成功后，执行 claude install 安装原生版本
-                        $nativeInstalled = Install-NativeClaude
-                        
-                        if ($nativeInstalled) {
-                            Write-Log "SUCCESS" "原生 Claude Code 已成功安装！"
-                        } else {
-                            Write-Log "WARN" "原生安装失败，但 pnpm 版 Claude Code 已可用。"
-                            Write-Log "INFO" "您可以稍后手动运行 'claude install' 安装原生版本。"
-                        }
-                        
-                        $installSuccess = $true
-                    } else {
-                        throw "pnpm 安装失败"
-                    }
-                } catch {
-                    Write-Log "ERROR" "pnpm 安装也失败了: $_"
-                    Write-Log "INFO" ""
-                    Write-Log "INFO" "建议手动安装："
-                    Write-Log "INFO" "1. 安装 Node.js: https://nodejs.org/"
-                    Write-Log "INFO" "2. 安装 pnpm: npm install -g pnpm"
-                    Write-Log "INFO" "3. 安装 Claude: pnpm add -g @anthropic-ai/claude-code"
-                }
-            } else {
-                Write-Log "WARN" "未找到 pnpm.ps1 脚本，无法自动回退。"
-                Write-Log "INFO" (Get-Message "BinaryLocation" $binaryPath)
-            }
+
+            $isInstallSuccessful = Invoke-PnpmFallback -InstallerPath $installerPath
         }
-        
-        if (-not $installSuccess) {
+
+        # 如果仍然失败，显示错误报告
+        if (-not $isInstallSuccessful) {
             $logFile = Save-Log
-            Write-Log "INFO" (Get-Message "LogSaved" $logFile)
+            Write-ErrorReport -ErrorType $errorInfo.Type `
+                -Message $errorMessage `
+                -Suggestion $errorInfo.Suggestion `
+                -LogFile $logFile
             exit 1
         }
-    } finally {
-        # 恢复原始错误处理设置
+    }
+    finally {
         $ErrorActionPreference = $originalErrorAction
-        
-        # 清理
-        if ($installSuccess) {
+
+        # 清理临时文件
+        if ($isInstallSuccessful) {
             Write-Log "INFO" (Get-Message "CleaningUp")
             Start-Sleep -Seconds 1
-            Remove-FileSafe -Path $binaryPath
+            Remove-FileSafe -Path $installerPath
         }
     }
+    #endregion
 
-    # 完成
-    if ($installSuccess) {
+    #region 完成
+    if ($isInstallSuccessful) {
         Write-Log "SUCCESS" ""
         Write-Log "SUCCESS" (Get-Message "InstallComplete")
         Write-Log "SUCCESS" ""
     }
+    #endregion
+}
+
+<#
+.SYNOPSIS
+    执行 pnpm 回退安装
+
+.DESCRIPTION
+    当原生安装失败时，回退到 pnpm 方式安装 Claude Code
+
+.PARAMETER InstallerPath
+    原生安装程序路径（用于清理）
+
+.OUTPUTS
+    [bool] 是否安装成功
+#>
+function Invoke-PnpmFallback {
+    [CmdletBinding()]
+    param([string]$InstallerPath)
+
+    $pnpmScriptLocal  = Join-Path $script:ScriptDir "pnpm.ps1"
+    $pnpmScriptRemote = "https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/pnpm.ps1"
+
+    # 下载 pnpm 脚本（如果不存在）
+    if (-not (Test-Path $pnpmScriptLocal)) {
+        Write-Log "INFO" "正在下载 pnpm 安装脚本..."
+        try {
+            Invoke-WebRequest -Uri $pnpmScriptRemote -OutFile $pnpmScriptLocal -UseBasicParsing
+            Write-Log "SUCCESS" "pnpm 脚本下载完成"
+        }
+        catch {
+            Write-Log "ERROR" "下载 pnpm 脚本失败: $_"
+            return $false
+        }
+    }
+
+    # 清理原生安装程序
+    Remove-FileSafe -Path $InstallerPath
+
+    # 执行 pnpm 安装
+    if (Test-Path $pnpmScriptLocal) {
+        Write-Log "INFO" "正在使用 pnpm 方式安装..."
+
+        try {
+            & $pnpmScriptLocal
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "SUCCESS" ""
+                Write-Log "SUCCESS" "pnpm 方式安装成功！"
+                Write-Log "SUCCESS" ""
+
+                # 尝试安装原生版本
+                $nativeInstalled = Install-NativeClaude
+
+                if ($nativeInstalled) {
+                    Write-Log "SUCCESS" "原生 Claude Code 已成功安装！"
+                }
+                else {
+                    Write-Log "WARN" "原生安装失败，但 pnpm 版 Claude Code 已可用。"
+                    Write-Log "INFO" "您可以稍后手动运行 'claude install' 安装原生版本。"
+                }
+
+                return $true
+            }
+        }
+        catch {
+            Write-Log "ERROR" "pnpm 安装失败: $_"
+        }
+    }
+
+    # 显示手动安装指导
+    Write-Log "INFO" ""
+    Write-Log "INFO" "建议手动安装："
+    Write-Log "INFO" "  1. 安装 Node.js: https://nodejs.org/"
+    Write-Log "INFO" "  2. 安装 pnpm:    npm install -g pnpm"
+    Write-Log "INFO" "  3. 安装 Claude:  pnpm add -g @anthropic-ai/claude-code"
+
+    return $false
 }
 
 # 主程序

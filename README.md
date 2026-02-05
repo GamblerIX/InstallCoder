@@ -32,7 +32,7 @@ irm https://raw.githubusercontent.com/GamblerIX/InstallCoder/main/ClaudeCode/mai
 
 ---
 
-### Claude Code（pnpm方式）
+### Claude Code（pnpm）
 
 > 当原生安装遇到证书问题时，会自动回退到此方式以在pnpm安装完成后尝试升级原生安装。
 > 如果Windows没有nodejs环境，将自动下载最新的LTS版本到 `~\nodejs` 中并添加系统级环境Path。
