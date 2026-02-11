@@ -1124,7 +1124,7 @@ function Install-ClaudeCode {
     $shouldSkipInstall    = $false
 
     if ($installedVersion) {
-        $versionComparison    = Compare-Version -Version1 $installedVersion -Version2 $targetVersion
+        $versionComparison    = Compare-Version -InstalledVersion $installedVersion -TargetVersion $targetVersion
         $isUpToDate           = $versionComparison -ge 0
         $shouldSkipInstall    = $isUpToDate -and -not $Force
 
@@ -1246,6 +1246,10 @@ function Install-ClaudeCode {
         $errorMessage = $installError.Exception.Message
         if ([string]::IsNullOrEmpty($errorMessage)) {
             $errorMessage = $installError.ToString()
+        }
+        # 确保错误消息不为空
+        if ([string]::IsNullOrEmpty($errorMessage)) {
+            $errorMessage = "安装过程中发生未知错误"
         }
 
         Write-Log "ERROR" (Get-Message "ErrorInstall")
